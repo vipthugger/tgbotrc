@@ -1,4 +1,16 @@
 
-aiogram>=3.18.0
-python-dotenv>=1.0.1
-twilio>=9.4.6
+services:
+  - type: web
+    name: telegram-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: pkill -f "python bot.py" || true && python healthcheck.py && python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: PORT
+        value: 8080
+    autoDeploy: false
+    numInstances: 1
+    healthCheckPath: /
+    healthCheckTimeout: 5
