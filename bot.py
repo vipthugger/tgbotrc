@@ -272,13 +272,13 @@ async def delete_wrong_messages(message: types.Message):
                         logging.info(f"Підготовка до видалення повідомлення: chat_id={chat_id}, thread_id={thread_id}, user_id={user_id}")
                         logging.info(f"Текст предупреждения: {deletion_message}")
 
-                    await message.delete()
-                    logging.info("Повідомлення успішно видалено")
+                        await message.delete()
+                        logging.info("Повідомлення успішно видалено")
 
-                    await send_warning_message(chat_id, thread_id, deletion_message, force=True, user_id=user_id)
-                    logging.info("Відправлено предупреждение о низкой цене")
-                except TelegramBadRequest as e:
-                    logging.error(f"Помилка при видаленні повідомлення з низькою ціною: {e}")
+                        await send_warning_message(chat_id, thread_id, deletion_message, force=True, user_id=user_id)
+                        logging.info("Відправлено предупреждение о низкой цене")
+                    except TelegramBadRequest as e:
+                        logging.error(f"Помилка при видаленні повідомлення з низькою ціною: {e}")
                 return
 
 @dp.message(lambda message: message.new_chat_members is not None)
