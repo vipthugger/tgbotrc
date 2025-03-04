@@ -1,0 +1,4 @@
+
+aiogram>=3.18.0
+python-dotenv>=1.0.1
+twilio>=9.4.6
