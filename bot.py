@@ -396,7 +396,7 @@ async def main():
     logging.info("Бот запущен и готов к работе")
     
     # Initialize Bot instance with a default parse mode and reset webhook
-    await dp.start_polling(bot, reset_webhook=True, timeout=30, allowed_updates=types.AllowedUpdates.MESSAGE)
+    await dp.start_polling(bot, reset_webhook=True, timeout=30)
 
 if __name__ == "__main__":
     try:
