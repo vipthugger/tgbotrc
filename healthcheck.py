@@ -1,4 +1,3 @@
-
 import requests
 import os
 import time
@@ -23,16 +22,34 @@ def check_running_bots():
         if len(bot_processes) > 1:
             logging.warning(f"Найдено {len(bot_processes)} запущенных экземпляров бота, завершаем их...")
             
+            # Сначала завершаем по SIGTERM
             for process in bot_processes:
                 try:
                     pid = int(process.split()[1])
                     logging.info(f"Завершение процесса бота с PID: {pid}")
-                    subprocess.run(['kill', str(pid)])
+                    subprocess.run(['kill', '-15', str(pid)])
                 except Exception as e:
-                    logging.error(f"Ошибка при завершении процесса: {e}")
+                    logging.error(f"Ошибка при завершении процесса SIGTERM: {e}")
             
             # Даем время на завершение процессов
-            time.sleep(5)
+            time.sleep(3)
+            
+            # Принудительно завершаем, если нужно
+            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
+            remaining = [p for p in result.stdout.split('\n') if 'python' in p and 'bot.py' in p and not 'grep' in p]
+            
+            if remaining:
+                logging.warning(f"Остались {len(remaining)} процессов, принудительно завершаем...")
+                for process in remaining:
+                    try:
+                        pid = int(process.split()[1])
+                        logging.info(f"Принудительное завершение процесса бота с PID: {pid}")
+                        subprocess.run(['kill', '-9', str(pid)])
+                    except Exception as e:
+                        logging.error(f"Ошибка при завершении процесса SIGKILL: {e}")
+                
+                time.sleep(2)
+            
             return True
         return True
     except Exception as e:
