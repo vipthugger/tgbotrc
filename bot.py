@@ -371,6 +371,21 @@ def run_http_server():
     httpd.serve_forever()
 
 async def main():
+    # Проверяем, что нет других экземпляров бота
+    import subprocess
+    import signal
+    import sys
+
+    # Функция для обработки сигналов завершения
+    def signal_handler(sig, frame):
+        logging.warning(f"Получен сигнал {sig}, завершение работы бота...")
+        asyncio.create_task(dp.stop_polling())
+        sys.exit(0)
+
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     # Start cleanup task
     asyncio.create_task(cleanup_old_warnings())
     asyncio.create_task(send_rules_reminder()) #added task for reminder
@@ -378,8 +393,15 @@ async def main():
     # Запуск HTTP сервера в отдельном потоке для healthcheck
     threading.Thread(target=run_http_server, daemon=True).start()
     
-    # Initialize Bot instance with a default parse mode
-    await dp.start_polling(bot, reset_webhook=True)
+    logging.info("Бот запущен и готов к работе")
+    
+    # Initialize Bot instance with a default parse mode and reset webhook
+    await dp.start_polling(bot, reset_webhook=True, timeout=30, allowed_updates=types.AllowedUpdates.MESSAGE)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот остановлен")
+    except Exception as e:
+        logging.error(f"Критическая ошибка: {e}")
