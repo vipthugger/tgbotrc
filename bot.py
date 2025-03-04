@@ -10,6 +10,8 @@ import re
 import os
 from dotenv import load_dotenv
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Налаштування логування
 logging.basicConfig(
@@ -353,12 +355,31 @@ async def send_rules_reminder():
             await asyncio.sleep(60)  # Чекаємо хвилину перед повторною спробою
 
 
+# Простой HTTP сервер для healthcheck и предотвращения предупреждений Render.com
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot is running')
+
+def run_http_server():
+    port = int(os.environ.get("PORT", 8080))
+    server_address = ('', port)
+    httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
+    logging.info(f"Запуск HTTP сервера на порту {port}")
+    httpd.serve_forever()
+
 async def main():
     # Start cleanup task
     asyncio.create_task(cleanup_old_warnings())
     asyncio.create_task(send_rules_reminder()) #added task for reminder
+    
+    # Запуск HTTP сервера в отдельном потоке для healthcheck
+    threading.Thread(target=run_http_server, daemon=True).start()
+    
     # Initialize Bot instance with a default parse mode
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, reset_webhook=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
