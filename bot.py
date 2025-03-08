@@ -375,6 +375,31 @@ def run_http_server():
     logger.info(f"Starting HTTP server on port {port}")
     httpd.serve_forever()
 
+async def send_warning_message(chat_id, thread_id, text, delete_after=5, user_id=None):
+    """Send a warning message and delete it after specified time"""
+    try:
+        warning_msg = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            message_thread_id=thread_id
+        )
+        
+        logger.info(f"Sent warning message to user ID {user_id if user_id else 'unknown'}")
+        
+        if delete_after > 0:
+            # Schedule deletion after specified time
+            await asyncio.sleep(delete_after)
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=warning_msg.message_id)
+                logger.info(f"Warning message deleted after {delete_after} seconds")
+            except Exception as e:
+                logger.error(f"Failed to delete warning message: {e}")
+                
+        return warning_msg
+    except Exception as e:
+        logger.error(f"Error sending warning message: {e}")
+        return None
+
 async def cleanup_task():
     """Periodically clean up tracked media groups"""
     while True:
@@ -402,6 +427,19 @@ async def main():
         await dp.start_polling(bot, reset_webhook=True)
     except Exception as e:
         logger.error(f"Critical error in main: {e}")
+
+@dp.message(lambda message: message.new_chat_members is not None)
+async def welcome_new_member(message: types.Message):
+    """Welcome new chat members"""
+    for new_member in message.new_chat_members:
+        username = f"@{new_member.username}" if new_member.username else "новий учасник"
+        await send_warning_message(
+            message.chat.id,
+            message.message_thread_id,
+            f"🤗 Вітаємо, {username}! Ознайомтеся з правилами, щоб уникнути непорозумінь та комфортно спілкуватися у чаті.",
+            delete_after=45,
+            user_id=new_member.id
+        )
 
 if __name__ == "__main__":
     try:
