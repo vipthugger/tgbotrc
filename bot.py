@@ -1,3 +1,4 @@
+
 import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
@@ -18,6 +19,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -27,274 +29,326 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-resale_topic_id = None  # ID гілки для оголошень
-processed_media_groups = {}  # Словник для зберігання повідомлень медіагруп
-user_warnings = {}  # Словник для зберігання часу останнього предупреждения для каждого пользователя
-
 # Регулярні вирази для визначення ціни
-price_pattern = re.compile(r"(\d+[\.,]?\d*)\s?(грн|k|к|kг|тис|₴|[₴])?", re.IGNORECASE)
+price_pattern = re.compile(r"(ціна:|price:|цена:).*?(\d+[\.,]?\d*)\s*(грн|k|к|kг|тис|₴|[₴])?", re.IGNORECASE)
+price_fallback_pattern = re.compile(r"(\d+[\.,]?\d*)\s*(грн|k|к|kг|тис|₴|[₴])?", re.IGNORECASE)
 
-async def cleanup_old_warnings():
-    """Очистка старых записей о предупреждениях"""
-    while True:
-        current_time = datetime.now()
-        users_to_remove = []
-        for user_id, warning_time in user_warnings.items():
-            if (current_time - warning_time) > timedelta(minutes=5):
-                users_to_remove.append(user_id)
-        for user_id in users_to_remove:
-            user_warnings.pop(user_id, None)
-        await asyncio.sleep(300)  # Проверка каждые 5 минут
+# Global variables
+processed_media_groups = {}
+user_warnings = {}
+resale_topic_id = None
+processed_message_groups = set()  # Track processed message groups to avoid duplicate warnings
 
-async def can_send_warning(user_id: int, force: bool = False) -> bool:
-    """Проверяет, можно ли отправить предупреждение пользователю"""
-    if force:
-        logging.info(f"Принудительная отправка предупреждения для user_id={user_id}")
-        return True
-
-    current_time = datetime.now()
-    if user_id in user_warnings:
-        last_warning_time = user_warnings[user_id]
-        time_since_last = (current_time - last_warning_time).total_seconds()
-        logging.info(f"Проверка интервала предупреждений для user_id={user_id}: прошло {time_since_last} секунд")
-        if time_since_last < 30:
-            logging.info(f"Пропуск предупреждения: слишком рано (нужно подождать еще {30 - time_since_last:.1f} сек)")
-            return False
-    user_warnings[user_id] = current_time
-    logging.info(f"Разрешена отправка предупреждения для user_id={user_id}")
-    return True
-
-async def send_warning_message(chat_id: int, thread_id: int | None, text: str, delete_after: int = 5, force: bool = False, user_id: int = None) -> None:
-    """Send a warning message to the chat and delete it after specified number of seconds"""
+async def extract_price(text: str) -> float | None:
+    """Extract price from text"""
     try:
-        if user_id and not await can_send_warning(user_id, force):
-            logging.info(f"Пропуск предупреждения для user_id={user_id} (слишком частые нарушения)")
-            return
-
-        logging.info(f"Подготовка к отправке предупреждения:")
-        logging.info(f"- chat_id: {chat_id}")
-        logging.info(f"- thread_id: {thread_id}")
-        logging.info(f"- user_id: {user_id}")
-        logging.info(f"- force: {force}")
-        logging.info(f"- текст: {text}")
-
-        bot_message = await bot.send_message(chat_id=chat_id, text=text, message_thread_id=thread_id)
-        logging.info(f"Предупреждение успешно отправлено (message_id={bot_message.message_id})")
-
-        await asyncio.sleep(delete_after)
-        await bot_message.delete()
-        logging.info(f"Предупреждение удалено через {delete_after} секунд")
-    except TelegramBadRequest as e:
-        logging.error(f"Ошибка при отправке/удалении предупреждения: {e}")
-        logging.error(f"Параметры: chat_id={chat_id}, thread_id={thread_id}, user_id={user_id}, force={force}")
-
-async def process_media_group_message(message: types.Message, reason: str) -> None:
-    """Process all messages in a media group"""
-    if not message.media_group_id:
-        try:
-            chat_id = message.chat.id
-            thread_id = message.message_thread_id
-            user_id = message.from_user.id
-            await message.delete()
-            await send_warning_message(chat_id, thread_id, reason, user_id=user_id)
-            logging.info(f"Обработано одиночное сообщение от @{message.from_user.username}")
-        except TelegramBadRequest as e:
-            logging.error(f"Ошибка при обработке одиночного сообщения: {e}")
-        return
-
-    media_group = processed_media_groups.get(message.media_group_id, {"messages": [], "processed": False})
-    media_group["messages"].append(message)
-    media_group["reason"] = reason
-    processed_media_groups[message.media_group_id] = media_group
-    logging.info(f"Добавлено сообщение в медиагруппу {message.media_group_id} от @{message.from_user.username}. Всего в группе: {len(media_group['messages'])}")
-
-    # Почекаємо трохи, щоб зібрати всі повідомлення медіагрупи
-    await asyncio.sleep(1)
-
-    if not media_group["processed"]:
-        media_group["processed"] = True
-        logging.info(f"Начало обработки медиагруппы {message.media_group_id}")
-
-        # Видаляємо всі повідомлення групи
-        chat_id = message.chat.id
-        thread_id = message.message_thread_id
-        user_id = message.from_user.id
-        for msg in media_group["messages"]:
+        # Сначала ищем цену после ключевых слов
+        matches = price_pattern.search(text.lower())
+        if matches:
+            price_str = matches.group(2).replace(',', '.')
             try:
-                await msg.delete()
-                logging.info(f"Удалено сообщение {msg.message_id} из медиагруппы {message.media_group_id}")
-            except TelegramBadRequest as e:
-                logging.error(f"Ошибка при удалении сообщения из медиагруппы: {e}")
+                price = float(price_str)
+                if matches.group(3) and matches.group(3).lower() in ['k', 'к', 'тис']:
+                    price *= 1000
+                logger.info(f"Извлечена цена после ключевого слова: {price} грн")
+                return price
+            except ValueError:
+                pass
 
-        # Надсилаємо одне повідомлення про порушення
-        await send_warning_message(chat_id, thread_id, reason, user_id=user_id)
+        # Если не нашли цену после ключевых слов, ищем просто числа
+        matches = price_fallback_pattern.finditer(text.lower())
+        max_price = 0
 
-        # Очищаємо дані медіагрупи
-        processed_media_groups.pop(message.media_group_id, None)
-        logging.info(f"Медиагруппа {message.media_group_id} полностью обработана")
+        for match in matches:
+            price_str = match.group(1).replace(',', '.')
+            try:
+                price = float(price_str)
+                if match.group(2) and match.group(2).lower() in ['k', 'к', 'тис']:
+                    price *= 1000
+                max_price = max(max_price, price)
+            except ValueError:
+                continue
 
-@dp.message(Command(commands=["notification"]))
-async def send_notification(message: types.Message):
-    """Send rules notification (admin only)"""
-    # Проверяем, является ли отправитель администратором
-    if message.from_user.id in [admin.user.id for admin in await message.chat.get_administrators()]:
-        try:
-            # Удаляем команду администратора
-            await message.delete()
-            logging.info(f"Команда /notification видалена")
+        logger.info(f"Извлечена максимальная цена: {max_price} грн")
+        return max_price if max_price > 0 else None
+    except Exception as e:
+        logger.error(f"Ошибка при извлечении цены: {e}")
+        return None
 
-            # Отправляем правила в чат
+async def can_manage_messages(chat_id: int) -> bool:
+    """Check if bot has permission to delete messages"""
+    try:
+        chat_member = await bot.get_chat_member(chat_id, bot.id)
+        # Проверяем правильные атрибуты в объекте chat_member
+        is_admin = getattr(chat_member, "status", None) in ["administrator", "creator"]
+        can_delete = getattr(chat_member, "can_delete_messages", False)
+        
+        logger.info(f"Bot permissions in chat {chat_id}: is_admin={is_admin}, can_delete={can_delete}")
+        return is_admin and can_delete
+    except Exception as e:
+        logger.error(f"Error checking bot permissions: {e}")
+        return False
+
+async def delete_message_safe(message: types.Message) -> bool:
+    """Safely delete a message with permission check"""
+    try:
+        if not await can_manage_messages(message.chat.id):
+            logger.warning(f"Bot doesn't have permission to delete messages in chat {message.chat.id}")
+            return False
+        await message.delete()
+        return True
+    except Exception as e:
+        logger.error(f"Error deleting message: {e}")
+        return False
+
+# Command handler specifically defined BEFORE the general message handler
+@dp.message(Command("resale_topic"))
+async def set_resale_topic(message: types.Message):
+    """Set the topic for resale messages (admin only)"""
+    global resale_topic_id
+    logger.info(f"Received /resale_topic command from @{message.from_user.username}")
+    
+    try:
+        # Get admin list
+        chat_admins = await message.chat.get_administrators()
+        admin_ids = [admin.user.id for admin in chat_admins]
+        
+        if message.from_user.id in admin_ids:
+            logger.info(f"Admin {message.from_user.username} authorized to set resale topic")
+            resale_topic_id = message.message_thread_id
+            
+            try:
+                await message.delete()
+                logger.info(f"Command /resale_topic deleted")
+            except Exception as e:
+                logger.error(f"Failed to delete command message: {e}")
+            
+            # Send a confirmation message
+            await bot.send_message(
+                chat_id=message.chat.id,
+                text="✅ Бот тепер контролює цю гілку на відповідність правилам.",
+                message_thread_id=message.message_thread_id
+            )
+            
+            # Send rules to this topic
             await bot.send_message(
                 chat_id=message.chat.id,
                 text=RULES_TEXT,
                 message_thread_id=message.message_thread_id,
                 disable_notification=False
             )
-            logging.info(f"Відправлено правила за командою адміністратора")
-        except TelegramBadRequest as e:
-            logging.error(f"Помилка при видаленні команди або відправці правил: {e}")
-    else:
-        try:
-            # Если отправитель не администратор, удаляем сообщение
-            await message.delete()
-            logging.info(f"Видалено спробу використання команди /notification користувачем без прав")
-        except TelegramBadRequest as e:
-            logging.error(f"Помилка при видаленні команди від користувача: {e}")
-        await send_warning_message(message.chat.id, message.message_thread_id, "❌ Ця команда тільки для адміністраторів.")
+            logger.info(f"Rules sent by admin command: {message.text}")
+        else:
+            logger.info(f"Non-admin {message.from_user.username} tried to use admin command")
+            try:
+                await message.delete()
+            except Exception as e:
+                logger.error(f"Failed to delete unauthorized command: {e}")
+            await message.answer("❌ Ця команда тільки для адміністраторів.")
+    except Exception as e:
+        logger.error(f"Error in set_resale_topic: {e}", exc_info=True)
 
-@dp.message(Command(commands=["resale_topic"]))
-async def set_resale_topic(message: types.Message):
-    """Set the topic for resale messages (admin only)"""
-    global resale_topic_id
-    if message.from_user.id in [admin.user.id for admin in await message.chat.get_administrators()]:
-        resale_topic_id = message.message_thread_id
-        try:
-            await message.delete()
-            logging.info(f"Команда /resale_topic видалена")
-        except TelegramBadRequest as e:
-            logging.error(f"Помилка при видаленні команди: {e}")
+@dp.message(Command("notification"))
+async def send_notification(message: types.Message):
+    """Send rules notification (admin only)"""
+    try:
+        logger.info(f"Command handler triggered for: {message.text}")
+        # Get admin list
+        chat_admins = await message.chat.get_administrators()
+        admin_ids = [admin.user.id for admin in chat_admins]
         
-        # Отправляем сообщение о активации бота
-        await send_warning_message(message.chat.id, message.message_thread_id, "✅ Бот тепер контролює цю гілку на відповідність правилам.")
-        
-        # Сразу отправляем правила в эту тему
-        try:
+        if message.from_user.id in admin_ids:
+            logger.info(f"Admin {message.from_user.username} authorized to send rules")
+            try:
+                await message.delete()
+            except Exception as e:
+                logger.error(f"Failed to delete command message: {e}")
+            
             await bot.send_message(
                 chat_id=message.chat.id,
                 text=RULES_TEXT,
-                message_thread_id=message.message_thread_id,
-                disable_notification=True
+                message_thread_id=getattr(message, "message_thread_id", None),
+                disable_notification=False
             )
-            logging.info(f"Відправлено початкове нагадування про правила у гілку resale_topic")
-        except Exception as e:
-            logging.error(f"Помилка при відправці початкового нагадування: {e}")
-    else:
-        try:
-            await message.delete()
-        except TelegramBadRequest as e:
-            logging.error(f"Помилка при видаленні команди: {e}")
-        await send_warning_message(message.chat.id, message.message_thread_id, "❌ Ця команда тільки для адміністраторів.")
-
-@dp.message(lambda message: resale_topic_id and message.message_thread_id == resale_topic_id)
-async def delete_wrong_messages(message: types.Message):
-    """Handle messages in the resale topic"""
-    if message.from_user.id in [admin.user.id for admin in await message.chat.get_administrators()]:
-        return  # Адмінам можна все
-
-    # Проверяем сначала наличие текста или подписи к фото
-    message_text = message.text or message.caption
-    if not message_text:
-        # Если нет ни текста, ни подписи к фото
-        await process_media_group_message(
-            message,
-            f"❌ @{message.from_user.username}, ваше повідомлення було видалено. Необхідно додати текст з хештегом #куплю або #продам."
-        )
-        return
-
-    # Проверка хештегов
-    if not any(word in message_text.lower() for word in ["#куплю", "#продам"]):
-        await process_media_group_message(
-            message,
-            f"❌ @{message.from_user.username}, ваше повідомлення було видалено, оскільки воно не містить хештегів '#куплю' або '#продам'."
-        )
-        return
-
-    # Проверка запрещенных типов медиа
-    if any([
-        message.sticker,
-        message.voice,
-        message.video_note,
-        message.animation
-    ]):
-        await process_media_group_message(
-            message,
-            f"❌ @{message.from_user.username}, ваше повідомлення було видалено. В гілці оголошень дозволені тільки текстові повідомлення з фото та хештегами #куплю або #продам."
-        )
-        return
-
-    # Перевірка ціни (ціна повинна бути >= 3000 грн) тільки для объявлений #продам
-    is_selling = "#продам" in message_text.lower()  # Проверяем, это объявление о продаже
-    
-    logging.info(f"Перевірка ціни для повідомлення от @{message.from_user.username}, тип: {'#продам' if is_selling else '#куплю'}")
-    
-    if is_selling:  # Проверяем цену только для объявлений #продам
-        # Ищем цену вблизи слова "цена" или "ціна"
-        price_pattern_with_label = re.compile(r"(?:цена|ціна|price|вартість)\s*:?\s*(\d+[\.,]?\d*)\s*(?:грн|k|к|kг|тис|₴|[₴])?", re.IGNORECASE)
-        price_match_with_label = price_pattern_with_label.search(message_text)
-        
-        # Если не нашли по слову "цена", ищем по обычному паттерну
-        if price_match_with_label:
-            price_match = price_match_with_label
-            logging.info(f"Знайдено ціну по ключовому слову")
+            logger.info(f"Rules sent by admin command: {message.text}")
         else:
-            price_match = price_pattern.search(message_text)
-            logging.info(f"Цiна по ключовому слову не знайдена, використовуємо звичайний пошук")
+            logger.info(f"Non-admin {message.from_user.username} tried to use admin command")
+            try:
+                await message.delete()
+            except Exception as e:
+                logger.error(f"Failed to delete unauthorized command: {e}")
+            await message.answer("❌ Ця команда тільки для адміністраторів.")
+    except Exception as e:
+        logger.error(f"Error in send_notification: {e}", exc_info=True)
+
+# General message handler AFTER the command handlers
+@dp.message()
+async def handle_messages(message: types.Message):
+    """Handle all messages"""
+    try:
+        # Get message text
+        message_text = message.text or message.caption or ""
+        username = message.from_user.username or f"user_{message.from_user.id}"
         
-        if price_match:
-            price_value = price_match.group(1)
-            logging.info(f"Знайдено ціну в повідомленні: {price_value}")
-            if price_value:
-                price_value = price_value.replace(",", ".").lower()
-                price_value = float(price_value) if price_value.isdigit() or price_value.replace('.', '', 1).isdigit() else None
-                
-                # Проверяем, указана ли цена в "k" или "к" (тысячах)
-                price_unit = price_match.group(2) if len(price_match.groups()) > 1 else None
-                if price_unit and price_unit.lower() in ['k', 'к', 'kг']:
-                    price_value = price_value * 1000
-                    
-                logging.info(f"Оброблене значення ціни: {price_value}")
-                deletion_message = ""
-                if price_value and price_value < 3000:  # Оставляем < чтобы цена 3000 грн была допустима
-                    deletion_message = f"❌ @{message.from_user.username}, ваше повідомлення було видалено, оскільки ціна оголошення менше 3000 грн."
-                    logging.info(f"Видалено повідомлення з низькою ціною від @{message.from_user.username} (ціна: {price_value} грн)")
-                    try:
-                        chat_id = message.chat.id
-                        thread_id = message.message_thread_id
-                        user_id = message.from_user.id
-                        logging.info(f"Підготовка до видалення повідомлення: chat_id={chat_id}, thread_id={thread_id}, user_id={user_id}")
-                        logging.info(f"Текст предупреждения: {deletion_message}")
+        # Detect message type for logging
+        if message.sticker:
+            content_type = "sticker"
+        elif message.animation:
+            content_type = "GIF"
+        elif message.video:
+            content_type = "video"
+        elif message.photo:
+            content_type = "photo"
+        else:
+            content_type = "text"
+            
+        logger.info(f"Processing {content_type} from @{username}: {message_text[:100]}...")
 
-                        await message.delete()
-                        logging.info("Повідомлення успішно видалено")
+        # Skip command messages completely - critical fix
+        if message_text.startswith('/'):
+            logger.info(f"Skipping command message: {message_text}")
+            return
+            
+        try:
+            # Check if user is admin more safely
+            chat_admins = await message.chat.get_administrators()
+            admin_ids = [admin.user.id for admin in chat_admins]
+            is_admin = message.from_user.id in admin_ids
 
-                        await send_warning_message(chat_id, thread_id, deletion_message, force=True, user_id=user_id)
-                        logging.info("Відправлено предупреждение о низкой цене")
-                    except TelegramBadRequest as e:
-                        logging.error(f"Помилка при видаленні повідомлення з низькою ціною: {e}")
+            if is_admin:
+                logger.info(f"Skipping admin message from @{username}")
                 return
 
-@dp.message(lambda message: message.new_chat_members is not None)
-async def welcome_new_member(message: types.Message):
-    """Welcome new chat members"""
-    for new_member in message.new_chat_members:
-        username = f"@{new_member.username}" if new_member.username else "новий учасник"
-        await send_warning_message(
-            message.chat.id,
-            message.message_thread_id,
-            f"🤗 Вітаємо, {username}! Ознайомтеся з правилами, щоб уникнути непорозумінь та комфортно спілкуватися у чаті.",
-            delete_after=45,
-            user_id=new_member.id
-        )
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            # If we can't check admin status, process message anyway
+            is_admin = False
+        
+        # Handle resale topic messages if applicable
+        if resale_topic_id and message.message_thread_id == resale_topic_id:
+            # Helper function to send warning and delete it after 5 seconds
+            async def send_warning_and_delete(chat_id, text, thread_id=None):
+                warning_msg = await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    message_thread_id=thread_id
+                )
+                # Schedule deletion after 5 seconds
+                await asyncio.sleep(5)
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=warning_msg.message_id)
+                    logger.info(f"Warning message deleted after 5 seconds")
+                except Exception as e:
+                    logger.error(f"Failed to delete warning message: {e}")
+            
+            # Check if this is part of a media group and we've already processed it
+            media_group_id = message.media_group_id
+            if media_group_id and media_group_id in processed_message_groups:
+                logger.info(f"Media group {media_group_id} already processed, just deleting message")
+                await delete_message_safe(message)
+                return
+                
+            # Track this message group if applicable
+            if media_group_id:
+                processed_message_groups.add(media_group_id)
+                logger.info(f"Added media group {media_group_id} to processed groups")
+            
+            # Determine the reason for deletion (if any) with priority for price issues
+            warning_message = None
+            
+            # First priority: Check for price in #продам messages
+            if message_text and "#продам" in message_text.lower():
+                price = await extract_price(message_text)
+                logger.info(f"Extracted price for selling post: {price}")
+                
+                if price is None or price < 3000:
+                    logger.info(f"Price too low or not found: {price}")
+                    warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки мінімальна ціна оголошення — 3000 грн."
+            
+            # Second priority: Check for missing hashtags
+            elif message_text and not any(word in message_text.lower() for word in ["#куплю", "#продам"]):
+                logger.info(f"Message in resale topic without required hashtags")
+                warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не містить хештегів '#куплю' або '#продам'."
+            
+            # Third priority: Check for media content without text
+            elif (message.sticker or 
+                (message.animation and not message_text) or 
+                (message.video and not message_text) or 
+                (message.photo and not message_text)):
+                logger.info(f"{content_type} without valid text in resale topic")
+                warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не відповідає правилам."
+            
+            # If we have a reason to delete, do it and send ONE warning
+            if warning_message:
+                if await delete_message_safe(message):
+                    await send_warning_and_delete(
+                        message.chat.id,
+                        warning_message,
+                        message.message_thread_id
+                    )
+                return
+            
+            logger.info("Message in resale topic passed all checks")
+            return
+        
+        # Process regular messages (non-resale topic)
+        # For stickers, GIFs, videos and photos without text, we don't need to process them
+        if message.sticker or message.animation or message.video or (message.photo and not message_text):
+            logger.info(f"Ignoring {content_type} in regular chat")
+            return
+            
+        # Skip empty text messages
+        if not message_text:
+            logger.info("Ignoring message without text in regular chat")
+            return
+            
+        # Проверяем длину сообщения (не более 500 символов)
+        if len(message_text) > 500:
+            logger.info(f"Message too long: {len(message_text)} characters")
+            if await delete_message_safe(message):
+                warning_msg = await message.answer(
+                    f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не відповідає правилам."
+                )
+                # Schedule deletion after 5 seconds
+                await asyncio.sleep(5)
+                try:
+                    await bot.delete_message(chat_id=message.chat.id, message_id=warning_msg.message_id)
+                    logger.info(f"Warning message deleted after 5 seconds")
+                except Exception as e:
+                    logger.error(f"Failed to delete warning message: {e}")
+            return
+
+        # Проверяем начинается ли с #Продам
+        is_selling = message_text.lower().startswith("#продам")
+        
+        # Если сообщение не о продаже, игнорируем его
+        if not is_selling:
+            logger.info("Message is not a selling post")
+            return
+
+        # Для объявлений о продаже проверяем цену
+        price = await extract_price(message_text)
+        logger.info(f"Extracted price: {price}")
+
+        if price is None or price < 3000:
+            logger.info(f"Price too low or not found: {price}")
+            if await delete_message_safe(message):
+                warning_msg = await message.answer(
+                    f"❌ @{username}, ваше повідомлення було видалено, оскільки мінімальна ціна оголошення — 3000 грн."
+                )
+                # Schedule deletion after 5 seconds
+                await asyncio.sleep(5)
+                try:
+                    await bot.delete_message(chat_id=message.chat.id, message_id=warning_msg.message_id)
+                    logger.info(f"Warning message deleted after 5 seconds")
+                except Exception as e:
+                    logger.error(f"Failed to delete warning message: {e}")
+            return
+
+        logger.info("Message passed all checks")
+
+    except Exception as e:
+        logger.error(f"Error processing message: {e}", exc_info=True)
 
 RULES_TEXT = """Правила гілки ПРОДАЖ / КУПІВЛЯ 📌
 
@@ -304,58 +358,9 @@ RULES_TEXT = """Правила гілки ПРОДАЖ / КУПІВЛЯ 📌
 4. Оголошення, що не відповідають тематиці або не містять необхідної інформації, будуть видалятися.
 5. Адміністрація залишає за собою право видаляти повідомлення без попередження.
 
-⚠️ Порушення правил може призвести до видалення повідомлень або блокування користувача. Дотримання цих правил допоможе підтримувати порядок у чаті.""" # Актуальний текст правил
+⚠️ Порушення правил може призвести до видалення повідомлень або блокування користувача. Дотримання цих правил допоможе підтримувати порядок у чаті."""
 
-async def send_rules_reminder():
-    """Відправка нагадувань про правила кожні 60 хвилин тільки в гілку resale_topic"""
-    logging.info("Запущено завдання відправки нагадувань про правила")
-    while True:
-        try:
-            # Очікуємо 60 хвилин перед відправкою нагадування
-            await asyncio.sleep(3600)  # 60 хвилин = 3600 секунд
-
-            # Перевіряємо, чи встановлена гілка resale_topic
-            if resale_topic_id is None:
-                logging.info("Гілка resale_topic не встановлена. Пропуск відправки нагадувань")
-                continue
-
-            # Якщо гілка встановлена, знаходимо її чат (глобальна змінна resale_topic_id 
-            # містить ID гілки, але нам також потрібен chat_id)
-            # Використовуємо останнє відоме значення chat_id з останнього повідомлення в цій гілці
-            updates = await bot.get_updates(limit=100, timeout=1)
-            chat_id = None
-
-            for update in updates:
-                if (update.message and 
-                    update.message.message_thread_id == resale_topic_id):
-                    chat_id = update.message.chat.id
-                    break
-
-            if not chat_id:
-                logging.warning("Не вдалося визначити chat_id для гілки resale_topic")
-                continue
-
-            logging.info(f"Підготовка до відправки нагадування про правила у гілку resale_topic (chat_id={chat_id}, thread_id={resale_topic_id})")
-
-            try:
-                # Відправляємо нагадування в гілку resale_topic
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=RULES_TEXT,
-                    message_thread_id=resale_topic_id,
-                    disable_notification=True  # Щоб не турбувати користувачів
-                )
-                logging.info(f"Відправлено нагадування про правила у гілку resale_topic")
-            except Exception as e:
-                logging.error(f"Помилка при відправці нагадування у гілку resale_topic: {e}")
-
-            logging.info("Цикл відправки нагадувань про правила завершено")
-        except Exception as e:
-            logging.error(f"Помилка у завданні відправки нагадувань: {e}")
-            await asyncio.sleep(60)  # Чекаємо хвилину перед повторною спробою
-
-
-# Простой HTTP сервер для healthcheck и предотвращения предупреждений Render.com
+# HTTP server for healthcheck
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -367,43 +372,41 @@ def run_http_server():
     port = int(os.environ.get("PORT", 8080))
     server_address = ('', port)
     httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
-    logging.info(f"Запуск HTTP сервера на порту {port}")
+    logger.info(f"Starting HTTP server on port {port}")
     httpd.serve_forever()
 
+async def cleanup_task():
+    """Periodically clean up tracked media groups"""
+    while True:
+        try:
+            # Clear processed media groups every minute
+            processed_message_groups.clear()
+            logger.info("Cleaned up processed media groups")
+            await asyncio.sleep(60)  # Wait for 1 minute
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {e}")
+            await asyncio.sleep(60)  # Wait even if there's an error
+
 async def main():
-    # Проверяем, что нет других экземпляров бота
-    import subprocess
-    import signal
-    import sys
+    try:
+        # Start HTTP server in separate thread
+        threading.Thread(target=run_http_server, daemon=True).start()
+        
+        # Start cleanup task
+        asyncio.create_task(cleanup_task())
 
-    # Функция для обработки сигналов завершения
-    def signal_handler(sig, frame):
-        logging.warning(f"Получен сигнал {sig}, завершение работы бота...")
-        asyncio.create_task(dp.stop_polling())
-        sys.exit(0)
+        logger.info("Bot started")
 
-    # Регистрируем обработчики сигналов
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # Start cleanup task
-    asyncio.create_task(cleanup_old_warnings())
-    asyncio.create_task(send_rules_reminder()) #added task for reminder
-    
-    # Запуск HTTP сервера в отдельном потоке для healthcheck
-    threading.Thread(target=run_http_server, daemon=True).start()
-    
-    logging.info("Бот запущен и готов к работе")
-    
-    # Initialize Bot instance with a default parse mode and reset webhook
-    # Явно закрываем все другие сессии для этого бота
-    await bot.session.close()
-    await dp.start_polling(bot, reset_webhook=True, timeout=30)
+        # Initialize Bot instance with a default parse mode and reset webhook
+        await bot.session.close()
+        await dp.start_polling(bot, reset_webhook=True)
+    except Exception as e:
+        logger.error(f"Critical error in main: {e}")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот остановлен")
+        logger.info("Bot stopped")
     except Exception as e:
-        logging.error(f"Критическая ошибка: {e}")
+        logger.error(f"Critical error: {e}")
