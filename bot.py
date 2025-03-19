@@ -37,7 +37,9 @@ price_fallback_pattern = re.compile(r"(\d+[\.,]?\d*)\s*(грн|k|к|kг|тис|�
 processed_media_groups = {}
 user_warnings = {}
 resale_topic_id = None
+report_chat_id = None
 processed_message_groups = set()  # Track processed message groups to avoid duplicate warnings
+reported_messages = set()  # Track reported messages to avoid duplicates
 
 async def extract_price(text: str) -> float | None:
     """Extract price from text"""
@@ -148,6 +150,88 @@ async def set_resale_topic(message: types.Message):
     except Exception as e:
         logger.error(f"Error in set_resale_topic: {e}", exc_info=True)
 
+@dp.message(Command("set_report_chat"))
+async def set_report_chat(message: types.Message):
+    """Set the chat for receiving reports (admin only)"""
+    global report_chat_id
+    logger.info(f"Received /set_report_chat command from @{message.from_user.username}")
+    
+    try:
+        # Get admin list
+        chat_admins = await message.chat.get_administrators()
+        admin_ids = [admin.user.id for admin in chat_admins]
+        
+        if message.from_user.id in admin_ids:
+            report_chat_id = message.chat.id
+            logger.info(f"Report chat set to {message.chat.id}")
+            await message.reply("✅ Цей чат встановлено для отримання скарг.")
+        else:
+            logger.info(f"Non-admin {message.from_user.username} tried to set report chat")
+            await message.reply("❌ Ця команда тільки для адміністраторів.")
+    except Exception as e:
+        logger.error(f"Error in set_report_chat: {e}")
+        await message.reply("❌ Помилка при встановленні чату для скарг.")
+
+@dp.message(Command("report"))
+async def handle_report(message: types.Message):
+    """Handle report command"""
+    try:
+        # Check if message is a reply
+        if not message.reply_to_message:
+            await message.reply("❌ Ви повинні відповісти на повідомлення, щоб залишити скаргу.")
+            return
+
+        # Check if report chat is set
+        if not report_chat_id:
+            await message.reply("❌ Адміністратори ще не налаштували чат для скарг.")
+            return
+
+        # Get report reason
+        reason = message.text.replace("/report", "").strip()
+        if not reason:
+            reason = "Причина не вказана"
+
+        # Check if message was already reported
+        msg_id = f"{message.chat.id}_{message.reply_to_message.message_id}"
+        if msg_id in reported_messages:
+            await message.reply("❌ Це повідомлення вже було відправлено адміністраторам.")
+            return
+
+        # Mark message as reported
+        reported_messages.add(msg_id)
+
+        # Get message link if possible
+        message_link = ""
+        try:
+            message_link = f"https://t.me/c/{str(message.chat.id)[4:]}/{message.reply_to_message.message_id}"
+        except Exception as e:
+            logger.error(f"Error getting message link: {e}")
+
+        # Prepare report message
+        report_text = (
+            f"🔔 Нова скарга!\n"
+            f"📌 Відправник: @{message.from_user.username or 'Anonymous'}\n"
+            f"📢 Причина: {reason}\n"
+            f"🔗 Посилання на повідомлення: {message_link}"
+        )
+
+        # Send report to admin chat
+        report_msg = await bot.send_message(
+            chat_id=report_chat_id,
+            text=report_text,
+            reply_to_message_id=None
+        )
+        
+        # Forward reported message
+        forwarded = await message.reply_to_message.forward(report_chat_id)
+
+        await message.reply("✅ Скаргу надіслано адміністраторам.")
+        logger.info(f"Report sent from @{message.from_user.username}")
+
+    except Exception as e:
+        logger.error(f"Error handling report: {e}")
+        await message.reply("❌ Помилка при обробці скарги.")
+
 @dp.message(Command("notification"))
 async def send_notification(message: types.Message):
     """Send rules notification (admin only)"""
@@ -241,18 +325,76 @@ async def handle_messages(message: types.Message):
                 except Exception as e:
                     logger.error(f"Failed to delete warning message: {e}")
             
-            # Check if this is part of a media group and we've already processed it
+            # For media groups, collect all messages before processing
             media_group_id = message.media_group_id
-            if media_group_id and media_group_id in processed_message_groups:
-                logger.info(f"Media group {media_group_id} already processed, just deleting message")
-                await delete_message_safe(message)
+            
+            if media_group_id:
+                # Store message in group and wait for others
+                if media_group_id not in processed_media_groups:
+                    processed_media_groups[media_group_id] = {
+                        'messages': [],
+                        'text': '',
+                        'timer': None
+                    }
+                
+                group = processed_media_groups[media_group_id]
+                group['messages'].append(message)
+                if message_text:
+                    group['text'] = message_text
+                
+                # Cancel existing timer if any
+                if group['timer']:
+                    group['timer'].cancel()
+                
+                # Set new timer to process group
+                async def process_media_group():
+                    await asyncio.sleep(1)  # Wait for all messages
+                    group = processed_media_groups.get(media_group_id)
+                    if not group:
+                        return
+                        
+                    # Check group rules
+                    text = group['text']
+                    warning_message = None
+                    
+                    if not text:
+                        warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не містить опису."
+                    elif "#продам" in text.lower():
+                        price = await extract_price(text)
+                        if price is None or price < 3000:
+                            warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки мінімальна ціна оголошення — 3000 грн."
+                    elif not any(tag in text.lower() for tag in ["#куплю", "#продам"]):
+                        warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не містить хештегів '#куплю' або '#продам'."
+                    
+                    if warning_message:
+                        logger.info(f"Media group violation: {warning_message}")
+                        # Delete all messages in group
+                        for msg in group['messages']:
+                            await delete_message_safe(msg)
+                        await send_warning_and_delete(
+                            message.chat.id,
+                            warning_message,
+                            message.message_thread_id
+                        )
+                    
+                    # Cleanup group
+                    processed_media_groups.pop(media_group_id, None)
+                
+                group['timer'] = asyncio.create_task(process_media_group())
                 return
                 
-            # Track this message group if applicable
-            if media_group_id:
-                processed_message_groups.add(media_group_id)
-                logger.info(f"Added media group {media_group_id} to processed groups")
-            
+            # Handle single photo
+            elif message.photo and not message_text:
+                logger.info(f"Single photo without text")
+                warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не містить опису."
+                if await delete_message_safe(message):
+                    await send_warning_and_delete(
+                        message.chat.id,
+                        warning_message,
+                        message.message_thread_id
+                    )
+                return
+                
             # Determine the reason for deletion (if any) with priority for price issues
             warning_message = None
             
@@ -278,14 +420,34 @@ async def handle_messages(message: types.Message):
                 logger.info(f"{content_type} without valid text in resale topic")
                 warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не відповідає правилам."
             
-            # If we have a reason to delete, do it and send ONE warning
+            # If we have a reason to delete, delete all messages in the media group
             if warning_message:
-                if await delete_message_safe(message):
-                    await send_warning_and_delete(
-                        message.chat.id,
-                        warning_message,
-                        message.message_thread_id
-                    )
+                if media_group_id:
+                    # Store message in media group tracking dict if not exists
+                    if media_group_id not in processed_media_groups:
+                        processed_media_groups[media_group_id] = []
+                    processed_media_groups[media_group_id].append(message)
+                    
+                    # If this is the first message, schedule deletion
+                    if is_first_in_group:
+                        async def delete_media_group():
+                            # Wait a bit for all media group messages to arrive
+                            await asyncio.sleep(2)
+                            # Delete all messages in the group
+                            for msg in processed_media_groups.get(media_group_id, []):
+                                await delete_message_safe(msg)
+                            # Clean up the group
+                            processed_media_groups.pop(media_group_id, None)
+                        
+                        asyncio.create_task(delete_media_group())
+                else:
+                    await delete_message_safe(message)
+                    
+                await send_warning_and_delete(
+                    message.chat.id,
+                    warning_message,
+                    message.message_thread_id
+                )
                 return
             
             logger.info("Message in resale topic passed all checks")
