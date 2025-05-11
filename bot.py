@@ -1,4 +1,3 @@
-
 import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
@@ -13,6 +12,7 @@ from dotenv import load_dotenv
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from cooldown_manager import CooldownManager
 
 # Налаштування логування
 logging.basicConfig(
@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
+
+# Initialize cooldown manager (1 hour = 3600 seconds)
+cooldown_manager = CooldownManager(cooldown_seconds=3600)
 
 # Get token from environment variable
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
@@ -265,6 +268,293 @@ async def send_notification(message: types.Message):
     except Exception as e:
         logger.error(f"Error in send_notification: {e}", exc_info=True)
 
+@dp.message(Command("resetcd"))
+async def reset_cooldown_command(message: types.Message):
+    """Reset cooldown for user (admin only)"""
+    try:
+        # Get admin list
+        chat_admins = await message.chat.get_administrators()
+        admin_ids = [admin.user.id for admin in chat_admins]
+        
+        if message.from_user.id not in admin_ids:
+            logger.info(f"Non-admin {message.from_user.username} tried to use admin command")
+            await send_warning_and_delete(
+                message.chat.id,
+                "❌ Ця команда тільки для адміністраторів.",
+                message.message_thread_id,
+                3
+            )
+            return
+            
+        # Parse command: /resetcd @username [buy|sell|all]
+        # Default is 'all' if not specified
+        args = message.text.split()
+        if len(args) < 2:
+            await send_warning_and_delete(
+                message.chat.id,
+                "❌ Використання: /resetcd @username [buy|sell|all]",
+                message.message_thread_id,
+                3
+            )
+            return
+            
+        # Get username (remove @ if present)
+        username = args[1].replace('@', '')
+        
+        # Get category (default to 'all')
+        category = 'all'
+        if len(args) >= 3 and args[2].lower() in ['buy', 'sell', 'all', 'куплю', 'продам']:
+            category = args[2].lower()
+            # Convert Ukrainian to English
+            if category == 'куплю':
+                category = 'buy'
+            elif category == 'продам':
+                category = 'sell'
+            
+        # Find user in chat
+        try:
+            # First try to get user ID directly from command if it's mentioned
+            user_id = None
+            
+            # Check if there's a numeric ID in the command
+            for arg in message.text.split():
+                if arg.isdigit():
+                    user_id = int(arg)
+                    break
+            
+            # If not found by ID, look in admins list
+            if not user_id:
+                for member in chat_admins:
+                    if member.user.username and member.user.username.lower() == username.lower():
+                        user_id = member.user.id
+                        break
+            
+            # If still not found, try to use reply to message
+            if not user_id and message.reply_to_message:
+                user_id = message.reply_to_message.from_user.id
+                username = message.reply_to_message.from_user.username or f"user_{user_id}"
+            
+            # If still not found, we can't proceed
+            if not user_id:
+                await send_warning_and_delete(
+                    message.chat.id,
+                    "❌ Не вдалося знайти користувача. Вкажіть ID користувача: /resetcd @username 123456789",
+                    message.message_thread_id,
+                    3
+                )
+                return
+                
+            # Reset cooldown
+            result = cooldown_manager.reset_cooldown(user_id, category)
+            
+            if result:
+                category_text = {
+                    'buy': 'купівлі (#куплю)',
+                    'sell': 'продажу (#продам)',
+                    'all': 'всіх типів'
+                }[category]
+                
+                await send_warning_and_delete(
+                    message.chat.id,
+                    f"✅ Кулдаун для @{username} скинуто для оголошень {category_text}.",
+                    message.message_thread_id,
+                    3
+                )
+                logger.info(f"Cooldown reset for user {user_id} in category {category}")
+            else:
+                await send_warning_and_delete(
+                    message.chat.id,
+                    f"⚠️ У користувача @{username} не було активних кулдаунів.",
+                    message.message_thread_id,
+                    3
+                )
+                
+        except Exception as e:
+            logger.error(f"Error finding user: {e}")
+            await send_warning_and_delete(
+                message.chat.id,
+                "❌ Не вдалося знайти користувача або скинути кулдаун.",
+                message.message_thread_id,
+                3
+            )
+            
+    except Exception as e:
+        logger.error(f"Error in reset_cooldown_command: {e}")
+        await send_warning_and_delete(
+            message.chat.id,
+            "❌ Помилка при обробці команди.",
+            message.message_thread_id,
+            3
+        )
+
+@dp.message(Command("changecd"))
+async def change_cooldown_command(message: types.Message):
+    """Change cooldown time for user (admin only)"""
+    try:
+        # Get admin list
+        chat_admins = await message.chat.get_administrators()
+        admin_ids = [admin.user.id for admin in chat_admins]
+        
+        if message.from_user.id not in admin_ids:
+            logger.info(f"Non-admin {message.from_user.username} tried to use admin command")
+            await send_warning_and_delete(
+                message.chat.id,
+                "❌ Ця команда тільки для адміністраторів.",
+                message.message_thread_id,
+                3
+            )
+            return
+            
+        # Parse command: /changecd @username [buy|sell|all] <time>
+        args = message.text.split()
+        if len(args) < 3:
+            usage_msg = "❌ Використання: /changecd @username [buy|sell|all] <час>\n\nПриклади часу: 30s (секунд), 15m (хвилин), 2h (годин), 1d (днів)"
+            await send_warning_and_delete(
+                message.chat.id,
+                usage_msg,
+                message.message_thread_id,
+                3
+            )
+            return
+            
+        # Get username (remove @ if present)
+        username = args[1].replace('@', '')
+        
+        # Get category and time
+        category = 'all'
+        time_str = args[-1]  # Last argument is time
+        
+        if len(args) >= 4:
+            category_arg = args[2].lower()
+            if category_arg in ['buy', 'sell', 'all', 'куплю', 'продам']:
+                category = category_arg
+                # Convert Ukrainian to English
+                if category == 'куплю':
+                    category = 'buy'
+                elif category == 'продам':
+                    category = 'sell'
+            
+        # Parse time string
+        seconds = cooldown_manager.parse_time_string(time_str)
+        if seconds is None:
+            await send_warning_and_delete(
+                message.chat.id,
+                "❌ Неправильний формат часу. Використовуйте формат: 30s, 15m, 2h, 1d",
+                message.message_thread_id,
+                3
+            )
+            return
+            
+        # Find user in chat
+        try:
+            # First try to get user ID directly from command if it's mentioned
+            user_id = None
+            
+            # Check if there's a numeric ID in the command
+            for arg in message.text.split():
+                if arg.isdigit():
+                    user_id = int(arg)
+                    break
+            
+            # If not found by ID, look in admins list
+            if not user_id:
+                for member in chat_admins:
+                    if member.user.username and member.user.username.lower() == username.lower():
+                        user_id = member.user.id
+                        break
+            
+            # If still not found, try to use reply to message
+            if not user_id and message.reply_to_message:
+                user_id = message.reply_to_message.from_user.id
+                username = message.reply_to_message.from_user.username or f"user_{user_id}"
+            
+            # If still not found, we can't proceed
+            if not user_id:
+                await send_warning_and_delete(
+                    message.chat.id,
+                    "❌ Не вдалося знайти користувача. Вкажіть ID користувача: /changecd @username 123456789 30m",
+                    message.message_thread_id,
+                    3
+                )
+                return
+                
+            # Set custom cooldown
+            result = cooldown_manager.set_custom_cooldown(user_id, category, seconds)
+            
+            if result:
+                category_text = {
+                    'buy': 'купівлі (#куплю)',
+                    'sell': 'продажу (#продам)',
+                    'all': 'всіх типів'
+                }[category]
+                
+                time_text = cooldown_manager.format_remaining_time(seconds)
+                await send_warning_and_delete(
+                    message.chat.id,
+                    f"✅ Кулдаун для @{username} змінено на {time_text} для оголошень {category_text}.",
+                    message.message_thread_id,
+                    3
+                )
+                logger.info(f"Custom cooldown set for user {user_id} in category {category}: {seconds}s")
+            else:
+                await send_warning_and_delete(
+                    message.chat.id,
+                    f"❌ Не вдалося встановити кулдаун для @{username}.",
+                    message.message_thread_id,
+                    3
+                )
+                
+        except Exception as e:
+            logger.error(f"Error finding user: {e}")
+            await send_warning_and_delete(
+                message.chat.id,
+                "❌ Не вдалося знайти користувача або змінити кулдаун.",
+                message.message_thread_id,
+                3
+            )
+            
+    except Exception as e:
+        logger.error(f"Error in change_cooldown_command: {e}")
+        await send_warning_and_delete(
+            message.chat.id,
+            "❌ Помилка при обробці команди.",
+            message.message_thread_id,
+            3
+        )
+
+# Helper function to send warning and delete it after N seconds
+async def send_warning_and_delete(chat_id, text, thread_id=None, delete_after=3):
+    warning_msg = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        message_thread_id=thread_id
+    )
+    # Schedule deletion after specified seconds
+    await asyncio.sleep(delete_after)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=warning_msg.message_id)
+        logger.info(f"Warning message deleted after {delete_after} seconds")
+    except Exception as e:
+        logger.error(f"Failed to delete warning message: {e}")
+    return warning_msg
+
+# Delete all messages in a media group
+async def delete_media_group_messages(media_group_id):
+    """Delete all messages in the given media group"""
+    if media_group_id not in processed_media_groups:
+        return
+    
+    group = processed_media_groups[media_group_id]
+    if isinstance(group, dict) and 'messages' in group:
+        for msg in group['messages']:
+            await delete_message_safe(msg)
+    elif isinstance(group, list):
+        for msg in group:
+            await delete_message_safe(msg)
+    
+    processed_media_groups.pop(media_group_id, None)
+    logger.info(f"Deleted all messages in media group {media_group_id}")
+
 # General message handler AFTER the command handlers
 @dp.message()
 async def handle_messages(message: types.Message):
@@ -310,21 +600,6 @@ async def handle_messages(message: types.Message):
         
         # Handle resale topic messages if applicable
         if resale_topic_id and message.message_thread_id == resale_topic_id:
-            # Helper function to send warning and delete it after 5 seconds
-            async def send_warning_and_delete(chat_id, text, thread_id=None):
-                warning_msg = await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    message_thread_id=thread_id
-                )
-                # Schedule deletion after 5 seconds
-                await asyncio.sleep(5)
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=warning_msg.message_id)
-                    logger.info(f"Warning message deleted after 5 seconds")
-                except Exception as e:
-                    logger.error(f"Failed to delete warning message: {e}")
-            
             # For media groups, collect all messages before processing
             media_group_id = message.media_group_id
             
@@ -357,14 +632,32 @@ async def handle_messages(message: types.Message):
                     text = group['text']
                     warning_message = None
                     
-                    if not text:
-                        warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не містить опису."
+                    # Check for cooldown first
+                    if "#куплю" in text.lower():
+                        category = "buy"
                     elif "#продам" in text.lower():
-                        price = await extract_price(text)
-                        if price is None or price < 3000:
-                            warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки мінімальна ціна оголошення — 3000 грн."
-                    elif not any(tag in text.lower() for tag in ["#куплю", "#продам"]):
-                        warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не містить хештегів '#куплю' або '#продам'."
+                        category = "sell"
+                    else:
+                        category = None
+                    
+                    if category:
+                        user_id = message.from_user.id
+                        in_cooldown, remaining_seconds = cooldown_manager.check_cooldown(user_id, category)
+                        
+                        if in_cooldown and remaining_seconds is not None:
+                            # User is under cooldown, prepare to delete all messages in group
+                            warning_message = f"❌ @{username}, ви можете розміщувати лише 1 оголошення на годину. Спробуйте пізніше."
+                            logger.info(f"Cooldown violation for user {user_id} in category {category}.")
+                        else:
+                            # Continue with other validations
+                            if not text:
+                                warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не містить опису."
+                            elif "#продам" in text.lower():
+                                price = await extract_price(text)
+                                if price is None or price < 3000:
+                                    warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки мінімальна ціна оголошення — 3000 грн."
+                            elif not any(tag in text.lower() for tag in ["#куплю", "#продам"]):
+                                warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не містить хештегів '#куплю' або '#продам'."
                     
                     if warning_message:
                         logger.info(f"Media group violation: {warning_message}")
@@ -374,8 +667,20 @@ async def handle_messages(message: types.Message):
                         await send_warning_and_delete(
                             message.chat.id,
                             warning_message,
-                            message.message_thread_id
+                            message.message_thread_id,
+                            3  # Delete after 3 seconds
                         )
+                        
+                        # If it was a cooldown violation, don't need to record attempt
+                        if in_cooldown and remaining_seconds is not None:
+                            pass
+                        elif category:
+                            cooldown_manager.record_attempt(user_id, category)
+                    else:
+                        # Post is valid, record cooldown if applicable
+                        if category:
+                            cooldown_manager.record_successful_post(user_id, category)
+                            logger.info(f"Activated cooldown for user {user_id} in category {category}")
                     
                     # Cleanup group
                     processed_media_groups.pop(media_group_id, None)
@@ -383,16 +688,48 @@ async def handle_messages(message: types.Message):
                 group['timer'] = asyncio.create_task(process_media_group())
                 return
                 
+            # Handle single message (not in media group)
+            
+            # Check for cooldown first
+            category = None
+            if "#куплю" in message_text.lower():
+                category = "buy"
+            elif "#продам" in message_text.lower():
+                category = "sell"
+                
+            if category:
+                user_id = message.from_user.id
+                in_cooldown, remaining_seconds = cooldown_manager.check_cooldown(user_id, category)
+                
+                if in_cooldown and remaining_seconds is not None:
+                    # User is under cooldown
+                    warning_message = f"❌ @{username}, ви можете розміщувати лише 1 оголошення на годину. Спробуйте пізніше."
+                    
+                    if await delete_message_safe(message):
+                        await send_warning_and_delete(
+                            message.chat.id,
+                            warning_message,
+                            message.message_thread_id,
+                            3  # Delete after 3 seconds
+                        )
+                    return
+            
+            # Continue with other validations if not under cooldown
+            warning_message = None
+            
             # Handle single photo
-            elif message.photo and not message_text:
+            if message.photo and not message_text:
                 logger.info(f"Single photo without text")
                 warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не містить опису."
                 if await delete_message_safe(message):
                     await send_warning_and_delete(
                         message.chat.id,
                         warning_message,
-                        message.message_thread_id
+                        message.message_thread_id,
+                        3  # Delete after 3 seconds
                     )
+                if category:
+                    cooldown_manager.record_attempt(user_id, category)
                 return
                 
             # Determine the reason for deletion (if any) with priority for price issues
@@ -420,35 +757,23 @@ async def handle_messages(message: types.Message):
                 logger.info(f"{content_type} without valid text in resale topic")
                 warning_message = f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не відповідає правилам."
             
-            # If we have a reason to delete, delete all messages in the media group
+            # If we have a reason to delete, delete and record attempt
             if warning_message:
-                if media_group_id:
-                    # Store message in media group tracking dict if not exists
-                    if media_group_id not in processed_media_groups:
-                        processed_media_groups[media_group_id] = []
-                    processed_media_groups[media_group_id].append(message)
-                    
-                    # If this is the first message, schedule deletion
-                    if is_first_in_group:
-                        async def delete_media_group():
-                            # Wait a bit for all media group messages to arrive
-                            await asyncio.sleep(2)
-                            # Delete all messages in the group
-                            for msg in processed_media_groups.get(media_group_id, []):
-                                await delete_message_safe(msg)
-                            # Clean up the group
-                            processed_media_groups.pop(media_group_id, None)
-                        
-                        asyncio.create_task(delete_media_group())
-                else:
-                    await delete_message_safe(message)
-                    
+                await delete_message_safe(message)
                 await send_warning_and_delete(
                     message.chat.id,
                     warning_message,
-                    message.message_thread_id
+                    message.message_thread_id,
+                    3  # Delete after 3 seconds
                 )
+                if category:
+                    cooldown_manager.record_attempt(user_id, category)
                 return
+            
+            # Message passed all checks, record successful post if it's a buy/sell post
+            if category:
+                cooldown_manager.record_successful_post(user_id, category)
+                logger.info(f"Activated cooldown for user {user_id} in category {category}")
             
             logger.info("Message in resale topic passed all checks")
             return
@@ -468,16 +793,12 @@ async def handle_messages(message: types.Message):
         if len(message_text) > 500:
             logger.info(f"Message too long: {len(message_text)} characters")
             if await delete_message_safe(message):
-                warning_msg = await message.answer(
-                    f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не відповідає правилам."
+                await send_warning_and_delete(
+                    message.chat.id,
+                    f"❌ @{username}, ваше повідомлення було видалено, оскільки воно не відповідає правилам.",
+                    message.message_thread_id,
+                    3  # Delete after 3 seconds
                 )
-                # Schedule deletion after 5 seconds
-                await asyncio.sleep(5)
-                try:
-                    await bot.delete_message(chat_id=message.chat.id, message_id=warning_msg.message_id)
-                    logger.info(f"Warning message deleted after 5 seconds")
-                except Exception as e:
-                    logger.error(f"Failed to delete warning message: {e}")
             return
 
         # Проверяем начинается ли с #Продам
@@ -495,16 +816,12 @@ async def handle_messages(message: types.Message):
         if price is None or price < 3000:
             logger.info(f"Price too low or not found: {price}")
             if await delete_message_safe(message):
-                warning_msg = await message.answer(
-                    f"❌ @{username}, ваше повідомлення було видалено, оскільки мінімальна ціна оголошення — 3000 грн."
+                await send_warning_and_delete(
+                    message.chat.id,
+                    f"❌ @{username}, ваше повідомлення було видалено, оскільки мінімальна ціна оголошення — 3000 грн.",
+                    message.message_thread_id,
+                    3  # Delete after 3 seconds
                 )
-                # Schedule deletion after 5 seconds
-                await asyncio.sleep(5)
-                try:
-                    await bot.delete_message(chat_id=message.chat.id, message_id=warning_msg.message_id)
-                    logger.info(f"Warning message deleted after 5 seconds")
-                except Exception as e:
-                    logger.error(f"Failed to delete warning message: {e}")
             return
 
         logger.info("Message passed all checks")
@@ -517,7 +834,7 @@ RULES_TEXT = """Правила гілки ПРОДАЖ / КУПІВЛЯ 📌
 1. У цій гілці дозволено лише оголошення з хештегами #куплю або #продам.
 2. Для оголошень з хештегом #продам обов'язково вказувати ціну. Мінімальна сума – 3000 грн.
 3. Для оголошень з хештегом #куплю вказувати бюджет/ціну не обов'язково.
-4. Оголошення, що не відповідають тематиці або не містять необхідної інформації, будуть видалятися.
+4. Ви можете розміщувати лише 1 оголошення кожного типу на годину.
 5. Адміністрація залишає за собою право видаляти повідомлення без попередження.
 
 ⚠️ Порушення правил може призвести до видалення повідомлень або блокування користувача. Дотримання цих правил допоможе підтримувати порядок у чаті."""
@@ -536,31 +853,6 @@ def run_http_server():
     httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
     logger.info(f"Starting HTTP server on port {port}")
     httpd.serve_forever()
-
-async def send_warning_message(chat_id, thread_id, text, delete_after=5, user_id=None):
-    """Send a warning message and delete it after specified time"""
-    try:
-        warning_msg = await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            message_thread_id=thread_id
-        )
-        
-        logger.info(f"Sent warning message to user ID {user_id if user_id else 'unknown'}")
-        
-        if delete_after > 0:
-            # Schedule deletion after specified time
-            await asyncio.sleep(delete_after)
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=warning_msg.message_id)
-                logger.info(f"Warning message deleted after {delete_after} seconds")
-            except Exception as e:
-                logger.error(f"Failed to delete warning message: {e}")
-                
-        return warning_msg
-    except Exception as e:
-        logger.error(f"Error sending warning message: {e}")
-        return None
 
 async def cleanup_task():
     """Periodically clean up tracked media groups"""
@@ -595,18 +887,12 @@ async def welcome_new_member(message: types.Message):
     """Welcome new chat members"""
     for new_member in message.new_chat_members:
         username = f"@{new_member.username}" if new_member.username else "новий учасник"
-        await send_warning_message(
+        await send_warning_and_delete(
             message.chat.id,
             message.message_thread_id,
             f"🤗 Вітаємо, {username}! Ознайомтеся з правилами, щоб уникнути непорозумінь та комфортно спілкуватися у чаті.",
-            delete_after=45,
-            user_id=new_member.id
+            5  # Delete after 5 seconds
         )
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped")
-    except Exception as e:
-        logger.error(f"Critical error: {e}")
+    asyncio.run(main())
