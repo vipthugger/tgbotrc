@@ -76,34 +76,29 @@ class XPDatabase:
             logger.error(f"Error getting user {user_id}: {e}")
             return None
     
-    async def create_or_update_user(self, user_id: int, username: str = None, first_name: str = None) -> bool:
-        """Create or update user in database"""
-        try:
-            async with aiosqlite.connect(self.db_path) as db:
-                # Check if user exists
-                cursor = await db.execute('SELECT user_id FROM xp_users WHERE user_id = ?', (user_id,))
-                exists = await cursor.fetchone()
-                
-                if exists:
-                    # Update existing user
-                    await db.execute('''
-                        UPDATE xp_users 
-                        SET username = ?, first_name = ?, updated_at = ?
-                        WHERE user_id = ?
-                    ''', (username, first_name, datetime.now().isoformat(), user_id))
-                else:
-                    # Create new user
-                    await db.execute('''
-                        INSERT INTO xp_users (user_id, username, first_name, xp, rank, daily_xp, daily_xp_date)
-                        VALUES (?, ?, ?, 0, 'Новачок', 0, ?)
-                    ''', (user_id, username, first_name, datetime.now().date().isoformat()))
-                
-                await db.commit()
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error creating/updating user {user_id}: {e}")
-            return False
+ async def create_or_update_user(self, user_id: int, username: str | None = None, first_name: str | None = None) -> bool:
+    """Create or update user in XP system"""
+    try:
+        async with aiosqlite.connect(self.db_path) as db:
+            # First, try to insert new user (ignore if already exists)
+            await db.execute('''
+                INSERT OR IGNORE INTO xp_users (user_id, username, first_name, xp, rank, daily_xp_date, created_at)
+                VALUES (?, ?, ?, 0, 'Новачок', ?, ?)
+            ''', (user_id, username, first_name, datetime.now().date().isoformat(), datetime.now().isoformat()))
+            
+            # Then, always update the existing user info (in case username/first_name changed)
+            await db.execute('''
+                UPDATE xp_users 
+                SET username = ?, first_name = ?, updated_at = ?
+                WHERE user_id = ?
+            ''', (username, first_name, datetime.now().isoformat(), user_id))
+            
+            await db.commit()
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error creating/updating user {user_id}: {e}")
+        return False
     
     async def can_gain_xp(self, user_id: int) -> bool:
         """Check if user can gain XP (cooldown + daily limit)"""
