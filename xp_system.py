@@ -234,6 +234,10 @@ class XPSystem:
             logger.error(f"Error getting leaderboard: {e}")
             return []
     
+    async def get_top_users(self, limit: int = 10) -> List[Dict]:
+        """Get top users by XP (alias for get_leaderboard)"""
+        return await self.get_leaderboard(limit)
+    
     def get_rank_emoji(self, rank: str) -> str:
         """Get emoji for rank"""
         rank_emojis = {
