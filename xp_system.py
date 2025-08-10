@@ -134,7 +134,7 @@ class XPSystem:
                 'first_name': user['first_name'],
                 'xp': user['xp'],
                 'rank': display_rank,
-                'daily_xp': user['daily_xp'],
+                'daily_xp': user.get('daily_xp', 0),
                 'next_rank': next_rank_info
             }
             
@@ -170,14 +170,21 @@ class XPSystem:
     async def remove_xp_admin(self, user_id: int, xp_amount: int, admin_id: int) -> bool:
         """Remove XP from user (admin command)"""
         try:
-            success = await self.db.remove_xp(user_id, xp_amount, "Административное снятие", admin_id)
+            user = await self.db.get_user(user_id)
+            if not user:
+                return False
+            
+            # Calculate new XP (don't go below 0)
+            current_xp = user['xp']
+            new_xp = max(0, current_xp - xp_amount)
+            
+            success = await self.db.set_xp(user_id, new_xp, f"Административное списание", admin_id)
             if not success:
                 return False
             
             # Update rank if necessary
-            user = await self.db.get_user(user_id)
-            if user and user['rank'] not in self.special_ranks:
-                new_rank = self.calculate_rank_from_xp(user['xp'])
+            if user['rank'] not in self.special_ranks:
+                new_rank = self.calculate_rank_from_xp(new_xp)
                 if new_rank != user['rank']:
                     await self.db.set_rank(user_id, new_rank, admin_id)
             
@@ -187,6 +194,30 @@ class XPSystem:
             logger.error(f"Error removing XP admin for user {user_id}: {e}")
             return False
     
+    async def set_xp_admin(self, user_id: int, xp_amount: int, admin_id: int) -> bool:
+        """Set user XP to specific amount (admin command)"""
+        try:
+            success = await self.db.set_xp(user_id, xp_amount, f"Административная установка XP", admin_id)
+            if not success:
+                return False
+            
+            # Update rank if necessary
+            user = await self.db.get_user(user_id)
+            if user and user['rank'] not in self.special_ranks:
+                new_rank = self.calculate_rank_from_xp(xp_amount)
+                if new_rank != user['rank']:
+                    await self.db.set_rank(user_id, new_rank, admin_id)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error setting XP admin for user {user_id}: {e}")
+            return False
+    
+    async def reset_xp_admin(self, user_id: int, admin_id: int) -> bool:
+        """Reset user XP to 0 (admin command)"""
+        return await self.set_xp_admin(user_id, 0, admin_id)
+    
     async def set_rank_admin(self, user_id: int, rank: str, admin_id: int) -> bool:
         """Set user rank (admin command)"""
         try:
@@ -195,31 +226,33 @@ class XPSystem:
             logger.error(f"Error setting rank admin for user {user_id}: {e}")
             return False
     
-    async def reset_xp_admin(self, user_id: int, admin_id: int) -> bool:
-        """Reset user XP (admin command)"""
+    async def get_leaderboard(self, limit: int = 10) -> List[Dict]:
+        """Get XP leaderboard"""
         try:
-            return await self.db.reset_xp(user_id, admin_id)
+            return await self.db.get_leaderboard(limit)
         except Exception as e:
-            logger.error(f"Error resetting XP admin for user {user_id}: {e}")
-            return False
-    
-    async def get_top_users(self, limit: int = 10) -> List[Dict]:
-        """Get top users for leaderboard"""
-        try:
-            return await self.db.get_top_users(limit)
-        except Exception as e:
-            logger.error(f"Error getting top users: {e}")
+            logger.error(f"Error getting leaderboard: {e}")
             return []
     
-    def get_rank_list(self) -> str:
-        """Get formatted list of available ranks and their requirements"""
-        rank_text = "<b>Доступні ранги:</b>\n\n"
-        
-        for threshold, rank in self.rank_thresholds:
-            rank_text += f"<b>{rank}</b> - {threshold} XP\n"
-        
-        rank_text += "\n<b>Спеціальні ранги:</b>\n"
-        rank_text += "<b>Ресейлер</b> - присвоюється адміністрацією\n"
-        rank_text += "• Додатково +1 оголошення на годину\n"
-        
-        return rank_text
+    def get_rank_emoji(self, rank: str) -> str:
+        """Get emoji for rank"""
+        rank_emojis = {
+            "Новачок": "🌱",
+            "Учасник": "👤", 
+            "Активіст": "⭐",
+            "Авторитет": "👑",
+            "Ветеран": "🏆",
+            "Легенда": "💎",
+            "Ресейлер": "💰",
+            "Адміністратор": "🔥"
+        }
+        return rank_emojis.get(rank, "❓")
+    
+    def format_xp_number(self, xp: int) -> str:
+        """Format XP number with proper spacing"""
+        return f"{xp:,}".replace(",", " ")
+    
+    def get_available_ranks(self) -> List[str]:
+        """Get list of available ranks for commands"""
+        regular_ranks = [rank for _, rank in self.rank_thresholds]
+        return regular_ranks + self.special_ranks
