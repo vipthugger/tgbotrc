@@ -76,7 +76,7 @@ class XPDatabase:
             logger.error(f"Error getting user {user_id}: {e}")
             return None
     
-    async def create_or_update_user(self, user_id: int, username: str | None = None, first_name: str | None = None) -> bool:
+    async def create_or_update_user(self, user_id: int, username: str = None, first_name: str = None) -> bool:
         """Create or update user in XP system"""
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -124,98 +124,108 @@ class XPDatabase:
             logger.error(f"Error checking XP cooldown for user {user_id}: {e}")
             return False
     
-    async def add_xp(self, user_id: int, xp_amount: int, reason: str = "Сообщение в чате", admin_id: int | None = None) -> bool:
+    async def add_xp(self, user_id: int, xp_amount: int, reason: str = "Активность в чате", admin_id: int = None) -> bool:
         """Add XP to user"""
         try:
             async with aiosqlite.connect(self.db_path) as db:
-                user = await self.get_user(user_id)
-                if not user:
-                    return False
+                # First ensure user exists
+                await self.create_or_update_user(user_id)
                 
+                # Reset daily XP if new day
                 today = datetime.now().date().isoformat()
-                current_daily_xp = user['daily_xp'] if user['daily_xp_date'] == today else 0
-                
-                # Reset daily XP if it's a new day
-                if user['daily_xp_date'] != today:
-                    current_daily_xp = 0
-                
-                # Check daily limit
-                if current_daily_xp + xp_amount > 100 and admin_id is None:
-                    xp_amount = max(0, 100 - current_daily_xp)
-                
-                if xp_amount <= 0:
-                    return False
-                
-                new_xp = user['xp'] + xp_amount
-                new_daily_xp = current_daily_xp + xp_amount
-                
-                # Update user XP
                 await db.execute('''
                     UPDATE xp_users 
-                    SET xp = ?, daily_xp = ?, daily_xp_date = ?, last_xp_time = ?, updated_at = ?
-                    WHERE user_id = ?
-                ''', (new_xp, new_daily_xp, today, datetime.now().isoformat(), datetime.now().isoformat(), user_id))
+                    SET daily_xp = 0, daily_xp_date = ?
+                    WHERE user_id = ? AND daily_xp_date != ?
+                ''', (today, user_id, today))
                 
-                # Log XP change
+                # Add XP and update timestamps
+                now = datetime.now().isoformat()
+                await db.execute('''
+                    UPDATE xp_users 
+                    SET xp = xp + ?, daily_xp = daily_xp + ?, last_xp_time = ?, updated_at = ?
+                    WHERE user_id = ?
+                ''', (xp_amount, xp_amount, now, now, user_id))
+                
+                # Add to history
                 await db.execute('''
                     INSERT INTO xp_history (user_id, xp_change, reason, admin_id)
                     VALUES (?, ?, ?, ?)
                 ''', (user_id, xp_amount, reason, admin_id))
                 
                 await db.commit()
-                logger.info(f"Added {xp_amount} XP to user {user_id} (total: {new_xp})")
+                
+                # Get total XP for logging
+                cursor = await db.execute('SELECT xp FROM xp_users WHERE user_id = ?', (user_id,))
+                row = await cursor.fetchone()
+                total_xp = row[0] if row else 0
+                
+                logger.info(f"Added {xp_amount} XP to user {user_id}, total: {total_xp}")
                 return True
                 
         except Exception as e:
             logger.error(f"Error adding XP to user {user_id}: {e}")
             return False
     
-    async def remove_xp(self, user_id: int, xp_amount: int, reason: str = "Административное снятие", admin_id: int | None = None) -> bool:
-        """Remove XP from user"""
+    async def set_xp(self, user_id: int, xp_amount: int, reason: str = "Адмін встановив XP", admin_id: int = None) -> bool:
+        """Set user XP to specific amount"""
         try:
             async with aiosqlite.connect(self.db_path) as db:
-                user = await self.get_user(user_id)
-                if not user:
-                    return False
+                # Ensure user exists
+                await self.create_or_update_user(user_id)
                 
-                new_xp = max(0, user['xp'] - xp_amount)
+                # Get current XP for history
+                cursor = await db.execute('SELECT xp FROM xp_users WHERE user_id = ?', (user_id,))
+                row = await cursor.fetchone()
+                current_xp = row[0] if row else 0
+                
+                xp_change = xp_amount - current_xp
                 
                 # Update user XP
+                now = datetime.now().isoformat()
                 await db.execute('''
                     UPDATE xp_users 
                     SET xp = ?, updated_at = ?
                     WHERE user_id = ?
-                ''', (new_xp, datetime.now().isoformat(), user_id))
+                ''', (xp_amount, now, user_id))
                 
-                # Log XP change
+                # Add to history
                 await db.execute('''
                     INSERT INTO xp_history (user_id, xp_change, reason, admin_id)
                     VALUES (?, ?, ?, ?)
-                ''', (user_id, -xp_amount, reason, admin_id))
+                ''', (user_id, xp_change, reason, admin_id))
                 
                 await db.commit()
-                logger.info(f"Removed {xp_amount} XP from user {user_id} (total: {new_xp})")
+                logger.info(f"Set XP for user {user_id} to {xp_amount}")
                 return True
                 
         except Exception as e:
-            logger.error(f"Error removing XP from user {user_id}: {e}")
+            logger.error(f"Error setting XP for user {user_id}: {e}")
             return False
     
-    async def set_rank(self, user_id: int, rank: str, admin_id: int | None = None) -> bool:
-        """Set user rank"""
+    async def reset_xp(self, user_id: int, admin_id: int = None) -> bool:
+        """Reset user XP to 0"""
+        return await self.set_xp(user_id, 0, "Адмін скинув XP", admin_id)
+    
+    async def set_rank(self, user_id: int, rank: str, admin_id: int = None) -> bool:
+        """Set custom rank for user"""
         try:
             async with aiosqlite.connect(self.db_path) as db:
+                # Ensure user exists
+                await self.create_or_update_user(user_id)
+                
+                now = datetime.now().isoformat()
                 await db.execute('''
                     UPDATE xp_users 
                     SET rank = ?, updated_at = ?
                     WHERE user_id = ?
-                ''', (rank, datetime.now().isoformat(), user_id))
+                ''', (rank, now, user_id))
                 
-                # Log rank change
+                # Add to history
                 await db.execute('''
                     INSERT INTO xp_history (user_id, xp_change, reason, admin_id)
-                    VALUES (?, ?, ?, ?)
-                ''', (user_id, 0, f"Ранг изменен на: {rank}", admin_id))
+                    VALUES (?, 0, ?, ?)
+                ''', (user_id, f"Встановлено ранг: {rank}", admin_id))
                 
                 await db.commit()
                 logger.info(f"Set rank {rank} for user {user_id}")
@@ -225,38 +235,15 @@ class XPDatabase:
             logger.error(f"Error setting rank for user {user_id}: {e}")
             return False
     
-    async def reset_xp(self, user_id: int, admin_id: int | None = None) -> bool:
-        """Reset user XP to 0"""
-        try:
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute('''
-                    UPDATE xp_users 
-                    SET xp = 0, rank = 'Новачок', daily_xp = 0, updated_at = ?
-                    WHERE user_id = ?
-                ''', (datetime.now().isoformat(), user_id))
-                
-                # Log XP reset
-                await db.execute('''
-                    INSERT INTO xp_history (user_id, xp_change, reason, admin_id)
-                    VALUES (?, ?, ?, ?)
-                ''', (user_id, 0, "XP сброшен", admin_id))
-                
-                await db.commit()
-                logger.info(f"Reset XP for user {user_id}")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error resetting XP for user {user_id}: {e}")
-            return False
-    
-    async def get_top_users(self, limit: int = 10) -> List[dict]:
+    async def get_leaderboard(self, limit: int = 10) -> List[dict]:
         """Get top users by XP"""
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute('''
-                    SELECT user_id, username, first_name, xp, rank 
-                    FROM xp_users 
-                    ORDER BY xp DESC 
+                    SELECT user_id, username, first_name, xp, rank
+                    FROM xp_users
+                    WHERE xp > 0
+                    ORDER BY xp DESC
                     LIMIT ?
                 ''', (limit,))
                 
@@ -265,5 +252,22 @@ class XPDatabase:
                 return [dict(zip(columns, row)) for row in rows]
                 
         except Exception as e:
-            logger.error(f"Error getting top users: {e}")
+            logger.error(f"Error getting leaderboard: {e}")
             return []
+    
+    async def get_user_rank_position(self, user_id: int) -> Optional[int]:
+        """Get user's position in leaderboard"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute('''
+                    SELECT COUNT(*) + 1 as position
+                    FROM xp_users u1, xp_users u2
+                    WHERE u1.user_id = ? AND u2.xp > u1.xp
+                ''', (user_id,))
+                
+                row = await cursor.fetchone()
+                return row[0] if row else None
+                
+        except Exception as e:
+            logger.error(f"Error getting rank position for user {user_id}: {e}")
+            return None
