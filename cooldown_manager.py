@@ -116,14 +116,14 @@ class CooldownManager:
             last_post_time = self.user_cooldowns[user_id][category]
             current_time = time.time()
             time_since_last_post = current_time - last_post_time
-            remaining_time = self.cooldown_seconds - time_since_last_post
             
+            remaining_time = self.cooldown_seconds - time_since_last_post
             return max(0, int(remaining_time))
             
         except Exception as e:
             logger.error(f"Error getting remaining time for user {user_id}, category {category}: {e}")
             return None
-
+    
     def get_reseller_posts_count(self, user_id: int, category: str) -> int:
         """Get number of posts made by reseller in current cooldown period"""
         try:
@@ -140,7 +140,6 @@ class CooldownManager:
             
             for user_id, categories in self.user_cooldowns.items():
                 categories_to_remove = []
-                
                 for category, timestamp in categories.items():
                     if current_time - timestamp >= self.cooldown_seconds:
                         categories_to_remove.append(category)
