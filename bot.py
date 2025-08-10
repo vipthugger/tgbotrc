@@ -256,6 +256,11 @@ async def delete_warning_after_delay(warning_message: types.Message, delay_secon
 async def cmd_myprofile(message: types.Message):
     """Show user's XP profile"""
     try:
+        # Check if user exists
+        if not message.from_user:
+            await message.reply("❌ Помилка: не вдалося визначити користувача.")
+            return
+        
         # Check if user is admin
         is_admin = await is_user_admin(message.chat.id, message.from_user.id)
         
@@ -343,13 +348,18 @@ async def cmd_top(message: types.Message):
 async def cmd_addxp(message: types.Message):
     """Add XP to user (admin only)"""
     try:
+        # Check if user exists
+        if not message.from_user:
+            await message.reply("❌ Помилка: не вдалося визначити користувача.")
+            return
+        
         # Check if user is admin
         if not await is_user_admin(message.chat.id, message.from_user.id):
             await message.reply("❌ Ця команда тільки для адміністраторів.")
             return
         
         # Parse command - must reply to user's message
-        if not message.reply_to_message:
+        if not message.reply_to_message or not message.reply_to_message.from_user:
             await message.reply("❌ Відповідайте на повідомлення користувача, якому хочете дати XP.\nВикористання: /addxp 100")
             return
         
@@ -385,13 +395,18 @@ async def cmd_addxp(message: types.Message):
 async def cmd_removexp(message: types.Message):
     """Remove XP from user (admin only)"""
     try:
+        # Check if user exists
+        if not message.from_user:
+            await message.reply("❌ Помилка: не вдалося визначити користувача.")
+            return
+        
         # Check if user is admin
         if not await is_user_admin(message.chat.id, message.from_user.id):
             await message.reply("❌ Ця команда тільки для адміністраторів.")
             return
         
         # Parse command - must reply to user's message
-        if not message.reply_to_message:
+        if not message.reply_to_message or not message.reply_to_message.from_user:
             await message.reply("❌ Відповідайте на повідомлення користувача, у якого хочете забрати XP.\nВикористання: /removexp 100")
             return
         
@@ -427,13 +442,18 @@ async def cmd_removexp(message: types.Message):
 async def cmd_setrank(message: types.Message):
     """Set user rank (admin only)"""
     try:
+        # Check if user exists
+        if not message.from_user:
+            await message.reply("❌ Помилка: не вдалося визначити користувача.")
+            return
+        
         # Check if user is admin
         if not await is_user_admin(message.chat.id, message.from_user.id):
             await message.reply("❌ Ця команда тільки для адміністраторів.")
             return
         
         # Parse command - must reply to user's message
-        if not message.reply_to_message:
+        if not message.reply_to_message or not message.reply_to_message.from_user:
             await message.reply("❌ Відповідайте на повідомлення користувача, якому хочете змінити ранг.\nВикористання: /setrank Ресейлер")
             return
         
@@ -462,13 +482,18 @@ async def cmd_setrank(message: types.Message):
 async def cmd_resetxp(message: types.Message):
     """Reset user XP (admin only)"""
     try:
+        # Check if user exists
+        if not message.from_user:
+            await message.reply("❌ Помилка: не вдалося визначити користувача.")
+            return
+        
         # Check if user is admin
         if not await is_user_admin(message.chat.id, message.from_user.id):
             await message.reply("❌ Ця команда тільки для адміністраторів.")
             return
         
         # Parse command - must reply to user's message
-        if not message.reply_to_message:
+        if not message.reply_to_message or not message.reply_to_message.from_user:
             await message.reply("❌ Відповідайте на повідомлення користувача, якому хочете скинути XP.\nВикористання: /resetxp")
             return
         
@@ -815,7 +840,6 @@ III. ПРАВИЛА ГІЛКИ ПРОДАЖУ / КУПІВЛІ
  3.10. Категорично заборонена реклама сторонніх каналів, посилань або сервісів без дозволу адміністрації.
 
 ⚠️ Порушення правил може призвести до видалення повідомлень, обмеження функцій або блокування користувача.
-
 💬 Для скарги: відповідайте на повідомлення командою /report [причина]
 """
 
