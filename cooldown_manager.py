@@ -1,291 +1,164 @@
 import time
-import json
-import os
 import logging
-import re
-from typing import Dict, Tuple, Optional, Union
+from datetime import datetime, timedelta
+from typing import Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 class CooldownManager:
-    """
-    Manages the cooldown system for the Telegram bot.
-    Tracks user posting in buy/sell categories and enforces cooldown periods.
-    """
-    def __init__(self, cooldown_seconds: int = 3600, storage_file: str = "cooldown_data.json"):
-        """
-        Initialize the cooldown manager.
-        
-        Args:
-            cooldown_seconds: Cooldown time in seconds (default: 3600 = 1 hour)
-            storage_file: File to persist cooldown data across bot restarts
-        """
+    """Manages cooldowns for user posts in different categories"""
+    
+    def __init__(self, cooldown_seconds: int = 43200):  # 12 hours default
         self.cooldown_seconds = cooldown_seconds
-        self.storage_file = storage_file
-        self.user_cooldowns = {}  # {user_id: {'buy': timestamp, 'sell': timestamp}}
-        self.temporary_attempts = {}  # {(user_id, category): attempts_count}
-        self.user_custom_cooldowns = {}  # {user_id: {'buy': custom_seconds, 'sell': custom_seconds}}
-        
-        # Load existing cooldown data if available
-        self._load_data()
-        
-        logging.debug(f"CooldownManager initialized with {cooldown_seconds}s cooldown")
+        self.user_cooldowns: Dict[int, Dict[str, float]] = {}  # user_id -> {category: timestamp}
+        self.reseller_posts: Dict[int, Dict[str, int]] = {}  # user_id -> {category: post_count}
     
-    def _load_data(self) -> None:
-        """Load cooldown data from storage file if it exists."""
+    def is_on_cooldown(self, user_id: int, category: str, user_rank: str = None) -> bool:
+        """Check if user is on cooldown for the given category"""
         try:
-            if os.path.exists(self.storage_file):
-                with open(self.storage_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, dict) and "cooldowns" in data:
-                        self.user_cooldowns = data["cooldowns"]
-                        if "custom_cooldowns" in data:
-                            self.user_custom_cooldowns = data["custom_cooldowns"]
-                    else:
-                        # Backwards compatibility with old format
-                        self.user_cooldowns = data
-                    logging.debug(f"Loaded cooldown data for {len(self.user_cooldowns)} users")
-        except Exception as e:
-            logging.error(f"Error loading cooldown data: {e}")
-            self.user_cooldowns = {}
-            self.user_custom_cooldowns = {}
-    
-    def _save_data(self) -> None:
-        """Save cooldown data to storage file."""
-        try:
-            data = {
-                "cooldowns": self.user_cooldowns,
-                "custom_cooldowns": self.user_custom_cooldowns
-            }
-            with open(self.storage_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f)
-        except Exception as e:
-            logging.error(f"Error saving cooldown data: {e}")
-    
-    def check_cooldown(self, user_id: int, category: str) -> Tuple[bool, Optional[int]]:
-        """
-        Check if a user is under cooldown for a specific category.
-        
-        Args:
-            user_id: The Telegram user ID
-            category: The category ('buy' or 'sell')
+            if user_id not in self.user_cooldowns:
+                return False
             
-        Returns:
-            Tuple[bool, Optional[int]]: (is_in_cooldown, remaining_seconds)
-        """
-        if str(user_id) not in self.user_cooldowns:
-            return False, None
-        
-        if category not in self.user_cooldowns[str(user_id)]:
-            return False, None
-        
-        last_post_time = self.user_cooldowns[str(user_id)][category]
-        current_time = time.time()
-        elapsed_time = current_time - last_post_time
-        
-        # Check if user has custom cooldown
-        cooldown_value = self.get_user_cooldown_seconds(user_id, category)
-        
-        if elapsed_time < cooldown_value:
-            remaining_time = int(cooldown_value - elapsed_time)
-            return True, remaining_time
-        
-        return False, None
-        
-    def get_user_cooldown_seconds(self, user_id: int, category: str) -> int:
-        """
-        Get the cooldown seconds for a specific user and category.
-        If user has custom cooldown, return that, otherwise return default.
-        
-        Args:
-            user_id: The Telegram user ID
-            category: The category ('buy' or 'sell')
+            if category not in self.user_cooldowns[user_id]:
+                return False
             
-        Returns:
-            int: Cooldown time in seconds
-        """
-        user_id_str = str(user_id)
-        if user_id_str in self.user_custom_cooldowns and category in self.user_custom_cooldowns[user_id_str]:
-            return self.user_custom_cooldowns[user_id_str][category]
-        return self.cooldown_seconds
-    
-    def record_successful_post(self, user_id: int, category: str) -> None:
-        """
-        Record a successful post, activating the cooldown for a user in a category.
-        
-        Args:
-            user_id: The Telegram user ID
-            category: The category ('buy' or 'sell')
-        """
-        # Initialize user entry if not exists
-        if str(user_id) not in self.user_cooldowns:
-            self.user_cooldowns[str(user_id)] = {}
-        
-        # Record current timestamp
-        self.user_cooldowns[str(user_id)][category] = time.time()
-        
-        # Remove any temporary attempts
-        key = (user_id, category)
-        if key in self.temporary_attempts:
-            del self.temporary_attempts[key]
-        
-        # Save data to file
-        self._save_data()
-        
-        logging.debug(f"Recorded successful post for user {user_id} in category {category}")
-    
-    def record_attempt(self, user_id: int, category: str) -> int:
-        """
-        Record a post attempt (used for tracking retries).
-        
-        Args:
-            user_id: The Telegram user ID
-            category: The category ('buy' or 'sell')
+            last_post_time = self.user_cooldowns[user_id][category]
+            current_time = time.time()
             
-        Returns:
-            int: The number of attempts made
-        """
-        key = (user_id, category)
-        if key not in self.temporary_attempts:
-            self.temporary_attempts[key] = 0
-        
-        self.temporary_attempts[key] += 1
-        return self.temporary_attempts[key]
-    
-    def get_attempts(self, user_id: int, category: str) -> int:
-        """
-        Get the number of attempts a user has made.
-        
-        Args:
-            user_id: The Telegram user ID
-            category: The category ('buy' or 'sell')
+            time_since_last_post = current_time - last_post_time
             
-        Returns:
-            int: The number of attempts made
-        """
-        key = (user_id, category)
-        return self.temporary_attempts.get(key, 0)
-    
-    def reset_attempts(self, user_id: int, category: str) -> None:
-        """
-        Reset the attempt counter for a user in a category.
-        
-        Args:
-            user_id: The Telegram user ID
-            category: The category ('buy' or 'sell')
-        """
-        key = (user_id, category)
-        if key in self.temporary_attempts:
-            del self.temporary_attempts[key]
-    
-    def format_remaining_time(self, seconds: int) -> str:
-        """
-        Format remaining cooldown time into a human-readable string.
-        
-        Args:
-            seconds: Remaining cooldown time in seconds
+            # Check if cooldown period has expired
+            if time_since_last_post >= self.cooldown_seconds:
+                return False  # Cooldown expired
             
-        Returns:
-            str: Formatted time string (e.g., "45 minutes and 30 seconds")
-        """
-        minutes, seconds = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        
-        if hours > 0:
-            return f"{hours} год{'ин' if hours > 1 else 'ина'} та {minutes} хвилин"
-        elif minutes > 0:
-            return f"{minutes} хвилин{'а' if minutes == 1 else ''} та {seconds} секунд"
-        else:
-            return f"{seconds} секунд"
+            # Check if Reseller has available posts within cooldown period
+            if user_rank == "Ресейлер":
+                posts_made = self.reseller_posts.get(user_id, {}).get(category, 0)
+                if posts_made < 2:
+                    return False  # Reseller can still make posts (up to 2 total)
             
-    def reset_cooldown(self, user_id: int, category: str = 'all') -> bool:
-        """
-        Reset the cooldown for a user in a specific category or all categories.
-        
-        Args:
-            user_id: The Telegram user ID
-            category: The category ('buy', 'sell', or 'all')
-            
-        Returns:
-            bool: True if cooldown was reset, False otherwise
-        """
-        user_id_str = str(user_id)
-        if user_id_str not in self.user_cooldowns:
-            return False
-            
-        if category == 'all':
-            # Reset all categories
-            self.user_cooldowns.pop(user_id_str, None)
-            self._save_data()
+            # Regular cooldown check - on cooldown
+            remaining_time = self.cooldown_seconds - time_since_last_post
+            logger.info(f"User {user_id} on cooldown for {category}, {remaining_time:.0f} seconds remaining")
             return True
-        elif category in ['buy', 'sell']:
-            # Reset specific category
-            if category in self.user_cooldowns[user_id_str]:
-                self.user_cooldowns[user_id_str].pop(category, None)
-                self._save_data()
+            
+        except Exception as e:
+            logger.error(f"Error checking cooldown for user {user_id}, category {category}: {e}")
+            return False
+    
+    def record_successful_post(self, user_id: int, category: str, user_rank: str = None) -> None:
+        """Record a successful post and start cooldown timer"""
+        try:
+            current_time = time.time()
+            
+            if user_id not in self.user_cooldowns:
+                self.user_cooldowns[user_id] = {}
+            
+            # For first post or after cooldown expired, reset timestamp
+            if category not in self.user_cooldowns[user_id] or \
+               (current_time - self.user_cooldowns[user_id][category]) >= self.cooldown_seconds:
+                self.user_cooldowns[user_id][category] = current_time
+                # Reset reseller post counter
+                if user_id in self.reseller_posts and category in self.reseller_posts[user_id]:
+                    del self.reseller_posts[user_id][category]
+            
+            # Track reseller posts
+            if user_rank == "Ресейлер":
+                if user_id not in self.reseller_posts:
+                    self.reseller_posts[user_id] = {}
+                if category not in self.reseller_posts[user_id]:
+                    self.reseller_posts[user_id][category] = 0
+                self.reseller_posts[user_id][category] += 1
+                logger.info(f"Reseller post {self.reseller_posts[user_id][category]}/2 recorded for user {user_id}, category {category}")
+            
+            logger.info(f"Post recorded for user {user_id}, category {category}")
+            
+        except Exception as e:
+            logger.error(f"Error recording post for user {user_id}, category {category}: {e}")
+    
+    def reset_cooldown(self, user_id: int, category: str = 'all') -> bool:
+        """Reset cooldown for user in specific category or all categories"""
+        try:
+            if user_id not in self.user_cooldowns:
+                return False
+            
+            if category == 'all':
+                # Reset all cooldowns for the user
+                self.user_cooldowns[user_id] = {}
+                # Reset reseller post counts
+                if user_id in self.reseller_posts:
+                    self.reseller_posts[user_id] = {}
+                logger.info(f"All cooldowns reset for user {user_id}")
                 return True
+            else:
+                # Reset specific category
+                if category in self.user_cooldowns[user_id]:
+                    del self.user_cooldowns[user_id][category]
+                    # Reset reseller post count for this category
+                    if user_id in self.reseller_posts and category in self.reseller_posts[user_id]:
+                        del self.reseller_posts[user_id][category]
+                    logger.info(f"Cooldown reset for user {user_id}, category {category}")
+                    return True
+                else:
+                    logger.info(f"No active cooldown found for user {user_id}, category {category}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error resetting cooldown for user {user_id}, category {category}: {e}")
+            return False
+    
+    def get_remaining_time(self, user_id: int, category: str) -> Optional[int]:
+        """Get remaining cooldown time in seconds"""
+        try:
+            if not self.is_on_cooldown(user_id, category):
+                return None
+            
+            last_post_time = self.user_cooldowns[user_id][category]
+            current_time = time.time()
+            time_since_last_post = current_time - last_post_time
+            remaining_time = self.cooldown_seconds - time_since_last_post
+            
+            return max(0, int(remaining_time))
+            
+        except Exception as e:
+            logger.error(f"Error getting remaining time for user {user_id}, category {category}: {e}")
+            return None
+
+    def get_reseller_posts_count(self, user_id: int, category: str) -> int:
+        """Get number of posts made by reseller in current cooldown period"""
+        try:
+            return self.reseller_posts.get(user_id, {}).get(category, 0)
+        except Exception as e:
+            logger.error(f"Error getting reseller posts count for user {user_id}, category {category}: {e}")
+            return 0
+    
+    def cleanup_expired_cooldowns(self) -> None:
+        """Clean up expired cooldowns to free memory"""
+        try:
+            current_time = time.time()
+            users_to_remove = []
+            
+            for user_id, categories in self.user_cooldowns.items():
+                categories_to_remove = []
                 
-        return False
-        
-    def set_custom_cooldown(self, user_id: int, category: str, seconds: int) -> bool:
-        """
-        Set a custom cooldown time for a user in a specific category.
-        
-        Args:
-            user_id: The Telegram user ID
-            category: The category ('buy', 'sell', or 'all')
-            seconds: Cooldown time in seconds
+                for category, timestamp in categories.items():
+                    if current_time - timestamp >= self.cooldown_seconds:
+                        categories_to_remove.append(category)
+                
+                # Remove expired categories
+                for category in categories_to_remove:
+                    del categories[category]
+                
+                # Mark user for removal if no active cooldowns
+                if not categories:
+                    users_to_remove.append(user_id)
             
-        Returns:
-            bool: True if custom cooldown was set, False otherwise
-        """
-        user_id_str = str(user_id)
-        
-        if seconds < 0:
-            return False
+            # Remove users with no active cooldowns
+            for user_id in users_to_remove:
+                del self.user_cooldowns[user_id]
             
-        # Initialize user entry if not exists
-        if user_id_str not in self.user_custom_cooldowns:
-            self.user_custom_cooldowns[user_id_str] = {}
-            
-        if category == 'all':
-            # Set for both categories
-            self.user_custom_cooldowns[user_id_str]['buy'] = seconds
-            self.user_custom_cooldowns[user_id_str]['sell'] = seconds
-        elif category in ['buy', 'sell']:
-            # Set for specific category
-            self.user_custom_cooldowns[user_id_str][category] = seconds
-        else:
-            return False
-            
-        self._save_data()
-        return True
-        
-    def parse_time_string(self, time_str: str) -> Optional[int]:
-        """
-        Parse a time string (e.g., '30m', '2h') into seconds.
-        
-        Args:
-            time_str: A string with number and unit (s/m/h/d)
-            
-        Returns:
-            Optional[int]: Time in seconds, or None if invalid format
-        """
-        if not time_str:
-            return None
-            
-        match = re.match(r'^(\d+)([smhd])$', time_str.lower())
-        if not match:
-            return None
-            
-        value, unit = match.groups()
-        value = int(value)
-        
-        if unit == 's':
-            return value
-        elif unit == 'm':
-            return value * 60
-        elif unit == 'h':
-            return value * 3600
-        elif unit == 'd':
-            return value * 86400
-            
-        return None
+            if users_to_remove or any(len(categories) > 0 for categories in self.user_cooldowns.values()):
+                logger.info(f"Cleanup completed. Removed {len(users_to_remove)} inactive users")
+                
+        except Exception as e:
+            logger.error(f"Error during cooldown cleanup: {e}")
